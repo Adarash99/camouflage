@@ -2,66 +2,100 @@ import numpy as np
 import cv2
 import time
 import os
+import random
 from CarlaHandler import *
 
-def main():
-    # Create a random patch (BGR format)
-    
-    patch_size = 16  # Size of the adversarial patch
-    patch = np.full((patch_size, patch_size, 3), (0, 255, 255), dtype=np.uint8)
-    #patch = np.random.randint(0, 256, (patch_size, patch_size, 3), dtype=np.uint8)
- 
-    # Initialize CARLA with custom resolution
-    handler = CarlaHandler(x_res=600, y_res=400)
-    handler.world_tick(10)
-    
-    # Spawn and configure vehicle
-    handler.spawn_vehicle('vehicle.tesla.model3')
-    handler.update_view('3d')
-    handler.change_spawn_point()
-    handler.update_distance(10)
-    handler.update_pitch(15)
-    handler.update_yaw(100)
-    handler.change_vehicle_color((255, 255, 0))  # Yellow (BGR)
-    handler.update_sun_altitude_angle(45)
-    handler.world_tick(100)
-    time.sleep(2)  # Wait for changes to apply
+# Parameters
+res = 500
+ref_color = (124, 124, 124)  # BGR format
+patch_size = 500  # Size of the adversarial patch
 
-    # Get images
-    image = handler.get_image()  # RGB format
-    seg_image = handler.get_segmentation()  # BGR format with cars in blue
-    
-    # Create precise vehicle mask (blue pixels in segmentation)
-    vehicle_mask = (seg_image[:,:,0] == 255) & \
-                   (seg_image[:,:,1] == 0) & \
-                   (seg_image[:,:,2] == 0)
-    
-    # Calculate required tiling to cover the entire image
-    h, w = image.shape[:2]
-    tiles_x = int(np.ceil(w / patch_size))
-    tiles_y = int(np.ceil(h / patch_size))
-    
-    # Create tiled texture that exactly matches image dimensions
-    tiled_texture = np.tile(patch, (tiles_y, tiles_x, 1))[:h, :w]
-    
-    # Apply texture only to vehicle pixels
-    textured_vehicle = image.copy()
-    textured_vehicle[vehicle_mask] = tiled_texture[vehicle_mask]
-    
-    # Display and save results
-    cv2.imshow('Original Vehicle', image)
-    cv2.imshow('Textured Vehicle', textured_vehicle)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-    
-    # Save images (convert RGB to BGR for saving)
-    os.makedirs('./data', exist_ok=True)
-    cv2.imwrite('./data/original.png', image)
-    cv2.imwrite('./data/segmentation.png', seg_image)
-    cv2.imwrite('./data/textured_vehicle.png', textured_vehicle)
-    
-    # Cleanup
-    del handler
+def main():
+    # Create directories
+    os.makedirs('./dataset/reference', exist_ok=True)
+    os.makedirs('./dataset/texture', exist_ok=True)
+    os.makedirs('./dataset/rendered', exist_ok=True)
+
+    try:
+        # Initialize CARLA
+        handler = CarlaHandler(x_res=res, y_res=res)
+        handler.world_tick(10)
+        handler.destroy_all_vehicles()
+        handler.world_tick(100)
+
+        # Spawn vehicle
+        handler.spawn_vehicle('vehicle.tesla.model3')
+        handler.update_view('3d')
+        n_spawn_points = handler.get_spawn_points()
+
+        for x in range(100):  # Generate 10 samples
+            print(f'Creating sample {x}')
+
+            try:
+                # Randomize parameters
+                handler.change_spawn_point(random.randint(1, n_spawn_points-1))
+                handler.update_distance(random.randint(5, 10))
+                handler.update_pitch(random.randint(0, 70))
+                handler.update_yaw(random.randint(0, 359))
+                handler.update_sun_altitude_angle(random.randint(20, 150))
+                handler.update_sun_azimuth_angle(random.randint(0, 360))
+                handler.world_tick(100)
+                time.sleep(0.1)
+
+                # Generate random color
+                rand_color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+
+                # 1. Get reference image (original color)
+                handler.change_vehicle_color(ref_color)
+                handler.world_tick(100)
+                time.sleep(0.1)
+                
+                # Get images
+                image = handler.get_image()  # RGB format
+                seg_image = handler.get_segmentation()  # BGR format
+                
+                
+                # Create vehicle mask (blue pixels in segmentation)
+                vehicle_mask = (seg_image[:,:,0] == 255) & \
+                            (seg_image[:,:,1] == 0) & \
+                            (seg_image[:,:,2] == 0)
+                
+
+                # Extract reference car pixels
+                reference_image = np.zeros_like(image)
+                reference_image[vehicle_mask] = image[vehicle_mask]
+                cv2.imwrite(f'./dataset/reference/{x}.png', reference_image)
+
+                # 2. Create texture image (black background with rand_color car)
+                texture_image = np.zeros_like(seg_image)  # Black background
+                texture_image[vehicle_mask] = rand_color  # Apply random color to car pixels
+                cv2.imwrite(f'./dataset/texture/{x}.png', cv2.cvtColor(texture_image, cv2.COLOR_RGB2BGR))
+
+                # 3. Get rendered image (actual RGB appearance with new color)
+                handler.change_vehicle_color(rand_color)
+                handler.world_tick(100)
+                time.sleep(0.1)  # Allow time for color change to render
+                
+                # Get the actual rendered RGB image
+                rendered_rgb = handler.get_image()  # RGB format
+                
+                # Create rendered image (black background with actual rendered car)
+                rendered_image = np.zeros_like(rendered_rgb)
+                rendered_image[vehicle_mask] = rendered_rgb[vehicle_mask]
+                cv2.imwrite(f'./dataset/rendered/{x}.png', rendered_image)
+
+            except Exception as e:
+                print(f"Error generating sample {x}: {e}")
+                continue
+
+    except Exception as e:
+        print(f"Main execution error: {e}")
+    finally:
+        if 'handler' in locals():
+            handler.destroy_all_vehicles()
+            del handler
+            os.system('pkill -9 Carla')
+        print("Cleanup completed")
 
 if __name__ == '__main__':
     main()

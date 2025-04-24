@@ -93,15 +93,21 @@ class CarlaHandler():
         """
         Cleanup function to destroy the vehicle and camera when the object is deleted.
         """
-        if self.vehicle is not None:
-            self.vehicle.destroy()
-        if self.camera is not None:
-            self.camera.destroy()
-        if self.seg_camera is not None:
-            self.seg_camera.destroy()
-        if self.spectator is not None:
-            self.spectator.destroy()
-        self.world.apply_settings(carla.WorldSettings())  # Reset to default settings
+        print('called the __del__ function')
+
+        try:
+
+            if self.vehicle is not None:
+                self.vehicle.destroy()
+            if self.camera is not None:
+                self.camera.destroy()
+            if self.seg_camera is not None:
+                self.seg_camera.destroy()
+            if self.spectator is not None:
+                self.spectator.destroy()
+            self.world.apply_settings(carla.WorldSettings())  # Reset to default settings
+        finally:
+            print('Ending. . .')
 
     def _update_spectator(self):
         
@@ -155,17 +161,6 @@ class CarlaHandler():
 
     def seg_camera_callback(self, image):
         """
-        Convert raw segmentation data to colored mask
-        This displays all the objects in different colours
-        """
-        '''
-        image.convert(carla.ColorConverter.CityScapesPalette)
-        array = np.frombuffer(image.raw_data, dtype=np.uint8)
-        array = array.reshape((image.height, image.width, 4))
-        with self.seg_lock:
-            self.seg_data['mask'] = array #cv2.cvtColor(array[:, :, :3], cv2.COLOR_RGB2BGR)
-        '''
-        """
         Convert segmentation to show only cars in blue (others black)
         """
         # Get raw segmentation data (CityScapes labels)
@@ -182,6 +177,8 @@ class CarlaHandler():
         
         with self.seg_lock:
             self.seg_data['mask'] = mask
+
+    
 
 
     def get_image(self):
@@ -214,6 +211,17 @@ class CarlaHandler():
             car_only[vehicle_mask] = self.image[vehicle_mask]
             
             return car_only
+        
+    def destroy_all_vehicles(self):
+        """
+        Safely destroy all vehicles in the CARLA world
+        """
+        # Get all actors and filter for vehicles
+        vehicle_list = self.world.get_actors().filter('vehicle.*')
+        
+        # Batch destroy command (most efficient method)
+        destroy_commands = [carla.command.DestroyActor(vehicle) for vehicle in vehicle_list]
+        self.client.apply_batch(destroy_commands)
 
     def spawn_vehicle(self, model):
         

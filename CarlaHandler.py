@@ -360,3 +360,57 @@ class CarlaHandler():
         """
         self.weather.fog_distance = value
         self.world.set_weather(self.weather)
+
+    def set_camera_viewpoint(self, yaw, pitch, distance):
+        """
+        Position camera at specified viewpoint relative to vehicle.
+
+        For EOT training: captures vehicle from different angles while keeping
+        vehicle stationary. Camera orbits around vehicle at fixed distance.
+
+        Args:
+            yaw: Horizontal angle in degrees (0=front, 90=right, 180=back, 270=left)
+            pitch: Vertical angle in degrees (negative = looking down at vehicle)
+            distance: Distance from vehicle center in meters
+
+        Example:
+            handler.set_camera_viewpoint(yaw=60, pitch=-15, distance=8)
+            # Camera positioned 60° clockwise from front, looking down 15°, 8m away
+        """
+        if self.vehicle is None:
+            raise ValueError("No vehicle spawned. Call spawn_vehicle() first.")
+
+        # Get vehicle transform
+        vehicle_transform = self.vehicle.get_transform()
+        vehicle_location = vehicle_transform.location
+        vehicle_yaw = vehicle_transform.rotation.yaw
+
+        # Convert angles to radians
+        yaw_rad = math.radians(vehicle_yaw + yaw)
+        pitch_rad = math.radians(pitch)
+
+        # Calculate camera position offset from vehicle
+        x_offset = math.cos(yaw_rad) * math.cos(pitch_rad) * distance
+        y_offset = math.sin(yaw_rad) * math.cos(pitch_rad) * distance
+        z_offset = math.sin(pitch_rad) * distance
+
+        # Camera position (orbiting around vehicle)
+        camera_pos = carla.Location(
+            x=vehicle_location.x - x_offset,
+            y=vehicle_location.y - y_offset,
+            z=vehicle_location.z + z_offset + 1.5  # +1.5m to account for vehicle height
+        )
+
+        # Camera rotation (always looking at vehicle center)
+        camera_rot = carla.Rotation(
+            pitch=-pitch,  # Negative because CARLA pitch convention
+            yaw=vehicle_yaw + yaw + 180,  # +180 to look back at vehicle
+            roll=0
+        )
+
+        # Update spectator camera
+        camera_transform = carla.Transform(camera_pos, camera_rot)
+        self.spectator.set_transform(camera_transform)
+
+        # Tick world to apply changes
+        self.world.tick()

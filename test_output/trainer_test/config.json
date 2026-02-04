@@ -1,0 +1,10 @@
+{
+  "learning_rate": 0.01,
+  "num_iterations": 100,
+  "checkpoint_every": 100,
+  "log_every": 10,
+  "epsilon": 0.0001,
+  "optimizer": "adam",
+  "output_dir": "test_output/trainer_test/",
+  "coarse_size": 128
+}

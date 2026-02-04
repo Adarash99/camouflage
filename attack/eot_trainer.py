@@ -80,6 +80,30 @@ def tile_texture_for_batch(texture, batch_size=6):
     return texture_batch
 
 
+def upsample_texture(coarse_texture, target_size=(500, 500)):
+    """
+    Upsample coarse texture to full resolution using bicubic interpolation.
+
+    Args:
+        coarse_texture: Coarse texture [H, W, 3] or [1, H, W, 3]
+        target_size: Target resolution (height, width), default (500, 500)
+
+    Returns:
+        Upsampled texture with same dimensionality as input
+    """
+    squeeze_output = False
+    if len(coarse_texture.shape) == 3:
+        coarse_texture = tf.expand_dims(coarse_texture, 0)
+        squeeze_output = True
+
+    upsampled = tf.image.resize(coarse_texture, target_size, method='bicubic')
+
+    if squeeze_output:
+        upsampled = tf.squeeze(upsampled, 0)
+
+    return upsampled
+
+
 def visualize_texture(texture_np, save_path):
     """
     Save texture as PNG for visual inspection.
@@ -108,6 +132,7 @@ DEFAULT_CONFIG = {
     'epsilon': 1e-4,  # Finite difference epsilon
     'optimizer': 'adam',
     'output_dir': 'experiments/phase1_eot/',
+    'coarse_size': 128,  # Texture parameterization size (128×128 → 500×500)
 }
 
 
@@ -223,6 +248,10 @@ class EOTTrainer:
         """
         Initialize texture parameters as tf.Variable.
 
+        Texture is initialized at coarse resolution (default 128×128) and
+        upsampled to 500×500 before rendering. This reduces parameter count
+        from 750k to ~49k for faster optimization.
+
         Args:
             init_type: Initialization strategy
                 - 'random_uniform': Random values in [0, 1] (Phase 1 default)
@@ -230,28 +259,32 @@ class EOTTrainer:
                 - 'constant': Constant gray (0.5)
 
         Returns:
-            tf.Variable: Texture [500, 500, 3] float32 [0, 1]
+            tf.Variable: Texture [coarse_size, coarse_size, 3] float32 [0, 1]
         """
-        print(f"Initializing texture: {init_type}")
+        coarse_size = self.config['coarse_size']
+        print(f"Initializing texture: {init_type} at {coarse_size}×{coarse_size}")
 
         if init_type == 'random_uniform':
-            texture_init = tf.random.uniform([500, 500, 3], minval=0.0, maxval=1.0)
+            texture_init = tf.random.uniform([coarse_size, coarse_size, 3], minval=0.0, maxval=1.0)
         elif init_type == 'random_normal':
-            texture_init = tf.random.normal([500, 500, 3], mean=0.5, stddev=0.1)
+            texture_init = tf.random.normal([coarse_size, coarse_size, 3], mean=0.5, stddev=0.1)
             texture_init = tf.clip_by_value(texture_init, 0.0, 1.0)
         elif init_type == 'constant':
-            texture_init = tf.ones([500, 500, 3]) * 0.5
+            texture_init = tf.ones([coarse_size, coarse_size, 3]) * 0.5
         else:
             raise ValueError(f"Unknown init_type: {init_type}")
 
         texture = tf.Variable(texture_init, dtype=tf.float32, trainable=True)
 
-        print(f"  ✓ Texture shape: {texture.shape}")
+        param_count = coarse_size * coarse_size * 3
+        print(f"  ✓ Texture shape: {texture.shape} ({param_count:,} parameters)")
+        print(f"  ✓ Upsampled to: 500×500 for rendering")
         print(f"  ✓ Initial mean: {tf.reduce_mean(texture).numpy():.4f}")
         print(f"  ✓ Initial std: {tf.math.reduce_std(texture).numpy():.4f}")
 
-        # Save initial texture
-        visualize_texture(texture.numpy(), str(self.viz_dir / 'texture_iter_0000.png'))
+        # Save initial texture (upsampled for visualization)
+        texture_full = upsample_texture(texture, (500, 500))
+        visualize_texture(texture_full.numpy(), str(self.viz_dir / 'texture_iter_0000.png'))
         np.save(str(self.checkpoint_dir / 'texture_iter_0000.npy'), texture.numpy())
 
         return texture
@@ -261,22 +294,26 @@ class EOTTrainer:
         Single forward pass through renderer + detector.
 
         Pipeline:
-            1. Tile texture for all viewpoints
-            2. Render via neural renderer (TensorFlow)
-            3. Convert to PyTorch and run detector
-            4. Compute attack loss
-            5. Extract metrics
+            1. Upsample coarse texture to full resolution (128×128 → 500×500)
+            2. Tile texture for all viewpoints
+            3. Render via neural renderer (TensorFlow)
+            4. Convert to PyTorch and run detector
+            5. Compute attack loss
+            6. Extract metrics
 
         Args:
-            texture: tf.Variable or tf.Tensor [500, 500, 3]
+            texture: tf.Variable or tf.Tensor [coarse_size, coarse_size, 3]
             x_ref_batch: Reference images [6, 500, 500, 3]
 
         Returns:
             loss_value: Scalar float (attack loss)
             metrics: Dict with max_confidence, mean_confidence, per_view_conf
         """
-        # 1. Tile texture for all viewpoints
-        texture_batch = tile_texture_for_batch(texture, batch_size=len(self.viewpoints))
+        # 1. Upsample coarse texture to full resolution
+        texture_full = upsample_texture(texture, (500, 500))
+
+        # 2. Tile texture for all viewpoints
+        texture_batch = tile_texture_for_batch(texture_full, batch_size=len(self.viewpoints))
 
         # 2. Render all views through neural renderer
         rendered_batch_tf = self.renderer.apply(x_ref_batch.numpy(), texture_batch.numpy())
@@ -373,17 +410,18 @@ class EOTTrainer:
 
         Args:
             iteration: Current iteration number
-            texture: Current texture tf.Variable
+            texture: Current texture tf.Variable (coarse resolution)
             metrics: Current metrics dict
         """
-        # Save numpy checkpoint
+        # Save numpy checkpoint (coarse resolution for resuming)
         texture_np = texture.numpy()
         checkpoint_path = self.checkpoint_dir / f'texture_iter_{iteration:04d}.npy'
         np.save(str(checkpoint_path), texture_np)
 
-        # Save visualization
+        # Save visualization (upsampled for viewing)
+        texture_full = upsample_texture(texture, (500, 500))
         viz_path = self.viz_dir / f'texture_iter_{iteration:04d}.png'
-        visualize_texture(texture_np, str(viz_path))
+        visualize_texture(texture_full.numpy(), str(viz_path))
 
         print(f"  Checkpoint saved: {checkpoint_path.name}")
 
@@ -392,12 +430,16 @@ class EOTTrainer:
         Save final results including texture, visualizations, and summary.
 
         Args:
-            final_texture: Final optimized texture [500, 500, 3]
+            final_texture: Final optimized texture [coarse_size, coarse_size, 3]
             training_history: List of training data rows from CSV logger
         """
-        # Save final texture
+        # Save final texture (coarse resolution for resuming)
         np.save(str(self.final_dir / 'texture_final.npy'), final_texture)
-        visualize_texture(final_texture, str(self.final_dir / 'texture_final.png'))
+
+        # Save visualization (upsampled for viewing)
+        final_texture_tf = tf.constant(final_texture)
+        final_texture_full = upsample_texture(final_texture_tf, (500, 500))
+        visualize_texture(final_texture_full.numpy(), str(self.final_dir / 'texture_final.png'))
 
         # Create summary
         if len(training_history) > 0:
@@ -569,6 +611,20 @@ if __name__ == "__main__":
     print(f"  ✓ Tiled {texture.shape} → {tiled.shape}")
     print()
 
+    # Test upsampling
+    print("Testing upsample_texture...")
+    coarse = tf.random.uniform([128, 128, 3])
+    upsampled = upsample_texture(coarse, (500, 500))
+    assert upsampled.shape == (500, 500, 3)
+    print(f"  ✓ Upsampled {coarse.shape} → {upsampled.shape}")
+
+    # Test with batch dimension
+    coarse_batch = tf.random.uniform([1, 128, 128, 3])
+    upsampled_batch = upsample_texture(coarse_batch, (500, 500))
+    assert upsampled_batch.shape == (1, 500, 500, 3)
+    print(f"  ✓ Upsampled batch {coarse_batch.shape} → {upsampled_batch.shape}")
+    print()
+
     # Test visualization
     print("Testing visualize_texture...")
     test_texture = np.random.rand(500, 500, 3).astype(np.float32)
@@ -594,6 +650,7 @@ if __name__ == "__main__":
         'learning_rate': 0.01,
         'num_iterations': 100,
         'output_dir': 'test_output/trainer_test/',
+        'coarse_size': 128,
     }
 
     trainer = EOTTrainer(
@@ -610,14 +667,19 @@ if __name__ == "__main__":
     print(f"  ✓ Trainer initialized with output dir: {trainer.output_dir}")
     print()
 
-    # Test texture initialization
-    print("Testing initialize_texture...")
+    # Test texture initialization (coarse resolution)
+    print("Testing initialize_texture (coarse parameterization)...")
     texture = trainer.initialize_texture('random_uniform')
-    assert texture.shape == (500, 500, 3)
+    assert texture.shape == (128, 128, 3), f"Expected (128, 128, 3), got {texture.shape}"
     assert texture.dtype == tf.float32
     assert 0.0 <= tf.reduce_min(texture).numpy() <= 1.0
     assert 0.0 <= tf.reduce_max(texture).numpy() <= 1.0
-    print(f"  ✓ Texture initialized: {texture.shape} dtype={texture.dtype}")
+    print(f"  ✓ Coarse texture initialized: {texture.shape} ({128*128*3:,} params)")
+
+    # Verify upsampling for rendering
+    texture_full = upsample_texture(texture, (500, 500))
+    assert texture_full.shape == (500, 500, 3)
+    print(f"  ✓ Upsampled for rendering: {texture_full.shape}")
     print()
 
     # Note: capture_reference_images() requires real CARLA connection

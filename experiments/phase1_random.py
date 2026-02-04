@@ -84,6 +84,7 @@ def main():
         'log_every': 10,
         'epsilon': 1e-4,
         'output_dir': 'experiments/phase1_eot/',
+        'coarse_size': 128,  # Texture parameterization (128×128 → 500×500)
     }
 
     for key, value in config.items():

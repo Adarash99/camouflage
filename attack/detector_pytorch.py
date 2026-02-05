@@ -112,10 +112,10 @@ class EfficientDetPyTorch:
 
     def forward_pre_nms(self, images_torch):
         """
-        Forward pass returning PRE-NMS outputs (differentiable!).
+        Forward pass returning PRE-NMS outputs (NO gradients).
 
-        This is the key method for adversarial attacks - it returns raw
-        logits and box predictions before NMS is applied.
+        This method is for inference/evaluation only. For training with
+        gradient flow, use forward_pre_nms_with_grad() instead.
 
         Args:
             images_torch: [batch, 3, 512, 512] float32 [0, 1]
@@ -125,36 +125,70 @@ class EfficientDetPyTorch:
             box_preds: [batch, num_anchors, 4] box deltas
         """
         with torch.no_grad():
-            # Run model forward pass
-            # EfficientDet returns a list of outputs (one per FPN level)
-            # We need to concatenate them
-            outputs = self.model(images_torch)
+            return self._forward_pre_nms_impl(images_torch)
 
-            # Handle different output formats from effdet
-            if isinstance(outputs, (list, tuple)) and len(outputs) == 2:
-                class_out, box_out = outputs
+    def forward_pre_nms_with_grad(self, images_torch):
+        """
+        Forward pass returning PRE-NMS outputs WITH gradient tracking.
 
-                # If outputs are lists of tensors (multi-level FPN), concatenate
-                if isinstance(class_out, list):
-                    # Flatten spatial dimensions: [B, C, H, W] → [B, H*W, C]
-                    class_out_flat = []
-                    for c in class_out:
-                        B, C, H, W = c.shape
-                        c_flat = c.permute(0, 2, 3, 1).reshape(B, H*W, C)
-                        class_out_flat.append(c_flat)
-                    class_out = torch.cat(class_out_flat, dim=1)
+        This is the key method for adversarial attacks with end-to-end
+        gradient flow. Unlike forward_pre_nms(), this method does NOT
+        wrap the computation in torch.no_grad(), allowing gradients to
+        flow back through the detector to the renderer and texture.
 
-                if isinstance(box_out, list):
-                    # Flatten spatial dimensions: [B, 4, H, W] → [B, H*W, 4]
-                    box_out_flat = []
-                    for b in box_out:
-                        B, C, H, W = b.shape
-                        b_flat = b.permute(0, 2, 3, 1).reshape(B, H*W, C)
-                        box_out_flat.append(b_flat)
-                    box_out = torch.cat(box_out_flat, dim=1)
+        Args:
+            images_torch: [batch, 3, 512, 512] float32 [0, 1]
+                         Should have requires_grad=True somewhere upstream
 
-            else:
-                raise ValueError(f"Unexpected output format from effdet: {type(outputs)}")
+        Returns:
+            class_logits: [batch, num_anchors, num_classes] raw logits (with grad)
+            box_preds: [batch, num_anchors, 4] box deltas (with grad)
+        """
+        return self._forward_pre_nms_impl(images_torch)
+
+    def _forward_pre_nms_impl(self, images_torch):
+        """
+        Internal implementation of pre-NMS forward pass.
+
+        Shared by both forward_pre_nms() and forward_pre_nms_with_grad().
+
+        Args:
+            images_torch: [batch, 3, 512, 512] float32 [0, 1]
+
+        Returns:
+            class_logits: [batch, num_anchors, num_classes] raw logits
+            box_preds: [batch, num_anchors, 4] box deltas
+        """
+        # Run model forward pass
+        # EfficientDet returns a list of outputs (one per FPN level)
+        # We need to concatenate them
+        outputs = self.model(images_torch)
+
+        # Handle different output formats from effdet
+        if isinstance(outputs, (list, tuple)) and len(outputs) == 2:
+            class_out, box_out = outputs
+
+            # If outputs are lists of tensors (multi-level FPN), concatenate
+            if isinstance(class_out, list):
+                # Flatten spatial dimensions: [B, C, H, W] → [B, H*W, C]
+                class_out_flat = []
+                for c in class_out:
+                    B, C, H, W = c.shape
+                    c_flat = c.permute(0, 2, 3, 1).reshape(B, H*W, C)
+                    class_out_flat.append(c_flat)
+                class_out = torch.cat(class_out_flat, dim=1)
+
+            if isinstance(box_out, list):
+                # Flatten spatial dimensions: [B, 4, H, W] → [B, H*W, 4]
+                box_out_flat = []
+                for b in box_out:
+                    B, C, H, W = b.shape
+                    b_flat = b.permute(0, 2, 3, 1).reshape(B, H*W, C)
+                    box_out_flat.append(b_flat)
+                box_out = torch.cat(box_out_flat, dim=1)
+
+        else:
+            raise ValueError(f"Unexpected output format from effdet: {type(outputs)}")
 
         return class_out, box_out
 

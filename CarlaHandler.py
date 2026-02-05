@@ -11,7 +11,7 @@ class CarlaHandler():
     spectator_views = ['top', '3d']
    
   
-    def __init__(self, host='localhost', port=2000, town='Town10HD', x_res=600, y_res=400):
+    def __init__(self, host='localhost', port=2000, town='Town10HD', x_res=1024, y_res=1024):
         
         """
         Initialize the CARLA client, world and set the world settings.
@@ -414,3 +414,48 @@ class CarlaHandler():
 
         # Tick world to apply changes
         self.world.tick()
+
+    def get_paintable_mask(self, color1=(128, 128, 128), color2=(255, 0, 0), threshold=0.02):
+        """
+        Generate mask showing only paintable surfaces.
+
+        Renders car in two different colors and compares - pixels that change
+        between the two renders are paintable surfaces (body panels). Pixels that
+        remain the same are structural features (rims, windows, headlights, plates).
+
+        Args:
+            color1: First vehicle color (R, G, B), default gray
+            color2: Second vehicle color (R, G, B), default red
+            threshold: Minimum normalized difference to consider a pixel as paintable.
+                      Higher values = stricter (fewer pixels marked paintable).
+                      Default: 0.02
+
+        Returns:
+            paintable_mask: Binary mask (H, W), float32, 1.0 = paintable, 0.0 = preserve
+        """
+        import time
+
+        # Capture with first color
+        self.change_vehicle_color(color1)
+        self.world_tick(50)
+        time.sleep(0.1)  # Wait for render to stabilize
+        ref1 = self.get_image().astype(np.float32) / 255.0
+
+        # Capture with second color
+        self.change_vehicle_color(color2)
+        self.world_tick(50)
+        time.sleep(0.1)
+        ref2 = self.get_image().astype(np.float32) / 255.0
+
+        # Get CARLA car segmentation mask
+        seg = self.get_segmentation()
+        car_mask = (seg[:, :, 0] == 255) & (seg[:, :, 1] == 0) & (seg[:, :, 2] == 0)
+
+        # Find pixels that changed significantly (paintable surfaces)
+        diff = np.abs(ref1 - ref2).max(axis=-1)  # Max diff across RGB channels
+        paintable = diff > threshold
+
+        # Combine: must be car AND paintable
+        paintable_mask = car_mask & paintable
+
+        return paintable_mask.astype(np.float32)

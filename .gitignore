@@ -181,3 +181,6 @@ docs/
 
 # Git worktrees
 .worktrees/
+
+# Dataset
+dataset_8k/

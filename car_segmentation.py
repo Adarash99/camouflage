@@ -3,26 +3,66 @@ import cv2
 import time
 import os
 import random
+import argparse
+import json
 from CarlaHandler import *
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Generate renderer training dataset')
+    parser.add_argument('--output-dir', default='./dataset', help='Output directory')
+    parser.add_argument('--num-samples', type=int, default=6400, help='Number of samples')
+    parser.add_argument('--start-index', type=int, default=0, help='Starting file index')
+    parser.add_argument('--resume', action='store_true', help='Resume from progress file')
+    return parser.parse_args()
+
+
+def save_progress(output_dir, file_n, sample_n):
+    """Save generation progress for resumability."""
+    progress_file = os.path.join(output_dir, '.progress.json')
+    with open(progress_file, 'w') as f:
+        json.dump({'file_n': file_n, 'sample_n': sample_n}, f)
+
+
+def load_progress(output_dir):
+    """Load generation progress from file."""
+    progress_file = os.path.join(output_dir, '.progress.json')
+    if os.path.exists(progress_file):
+        with open(progress_file) as f:
+            return json.load(f)
+    return None
 
 # Configurable Parameters
 vehicle_id = 'vehicle.tesla.model3'
-res = 500
+res = 1024  # Updated from 500 to 1024 for higher resolution
 ref_color = (124, 124, 124)  # BGR format
-patch_size = 500  # Size of the adversarial patch
+patch_size = 1024  # Size of the adversarial patch (updated from 500)
 
 
 def main():
+    args = parse_args()
 
-    file_n = 880 # file number to start from
-    total_sample_n = 150 # files to generate
+    # Initialize counters
+    file_n = args.start_index
+    total_sample_n = args.num_samples
     sample_n = 0
-
+    output_dir = args.output_dir
 
     # Create directories
-    os.makedirs('./dataset/reference', exist_ok=True)
-    os.makedirs('./dataset/texture', exist_ok=True)
-    os.makedirs('./dataset/rendered', exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'reference'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'texture'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'rendered'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'mask'), exist_ok=True)
+
+    # Resume from progress if requested
+    if args.resume:
+        progress = load_progress(output_dir)
+        if progress:
+            file_n = progress['file_n']
+            sample_n = progress['sample_n']
+            print(f"📂 Resuming from file_n={file_n}, sample_n={sample_n}/{total_sample_n}")
+        else:
+            print(f"📂 No progress file found, starting fresh")
 
     # Initialize CARLA
     handler, n_spawn_points = initialize_carla()
@@ -69,15 +109,36 @@ def main():
                 print(f"⚠️ Sample {sample_n}: Invalid mask (multiple cars or no car detected)")
                 continue
 
-            # Extract reference car pixels
-            reference_image = np.zeros_like(image)
-            reference_image[vehicle_mask] = image[vehicle_mask]
-            cv2.imwrite(f'./dataset/reference/{file_n}.png', reference_image)
+            # Save reference image with full background visible
+            reference_image = image.copy()
+            cv2.imwrite(os.path.join(output_dir, 'reference', f'{file_n}.png'), reference_image)
+
+            # Generate paintable surface mask
+            # Uses two-color comparison to identify pixels that change with vehicle color
+            paintable_mask = handler.get_paintable_mask(
+                color1=ref_color,  # Use reference color as first color
+                color2=(255, 0, 0),  # Red as second color
+                threshold=0.02
+            )
+
+            # Validate paintable mask (must have reasonable coverage)
+            paintable_pixels = paintable_mask.sum()
+            if paintable_pixels < 1000:
+                print(f"⚠️ Sample {sample_n}: Paintable mask too small ({paintable_pixels} pixels)")
+                continue
+
+            # Save mask as grayscale image
+            cv2.imwrite(os.path.join(output_dir, 'mask', f'{file_n}.png'), (paintable_mask * 255).astype(np.uint8))
+
+            # Reset vehicle to reference color for subsequent operations
+            handler.change_vehicle_color(ref_color)
+            handler.world_tick(50)
+            time.sleep(0.1)
 
             # 2. Create texture image (black background with rand_color car)
             texture_image = np.zeros_like(seg_image)  # Black background
             texture_image[vehicle_mask] = rand_color  # Apply random color to car pixels
-            cv2.imwrite(f'./dataset/texture/{file_n}.png', cv2.cvtColor(texture_image, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(os.path.join(output_dir, 'texture', f'{file_n}.png'), cv2.cvtColor(texture_image, cv2.COLOR_RGB2BGR))
 
             # 3. Get rendered image (actual RGB appearance with new color)
             handler.change_vehicle_color(rand_color)
@@ -87,24 +148,30 @@ def main():
             # Get the actual rendered RGB image
             rendered_rgb = handler.get_image()  # RGB format
             
-            # Create rendered image (black background with actual rendered car)
-            rendered_image = np.zeros_like(rendered_rgb)
-            rendered_image[vehicle_mask] = rendered_rgb[vehicle_mask]
-            cv2.imwrite(f'./dataset/rendered/{file_n}.png', rendered_image)
+            # Save rendered image with full background visible
+            rendered_image = rendered_rgb.copy()
+            cv2.imwrite(os.path.join(output_dir, 'rendered', f'{file_n}.png'), rendered_image)
 
-            print(f"✅ Sample {sample_n}: Generated reference, texture, and rendered images.")
+            print(f"✅ Sample {sample_n}/{total_sample_n}: Generated reference, texture, rendered, and mask images.")
 
             sample_n += 1
             file_n += 1
+
+            # Save progress periodically (every 10 samples)
+            if sample_n % 10 == 0:
+                save_progress(output_dir, file_n, sample_n)
 
         except Exception as e:
             print(f"Error generating sample {sample_n}: {e}")
             continue
 
+    # Save final progress
+    save_progress(output_dir, file_n, sample_n)
+    print(f"✅ Generation complete: {sample_n} samples saved to {output_dir}")
+
     if 'handler' in locals():
         handler.destroy_all_vehicles()
         del handler
-        os.system('pkill -9 Carla')
         print("Cleanup completed")
 
 

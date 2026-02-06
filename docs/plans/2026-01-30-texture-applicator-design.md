@@ -214,5 +214,76 @@ Manual verification:
 
 ---
 
-**Status:** Design approved, ready for implementation
-**Next:** Implement class and test with existing dataset
+## Intersection Overlay Feature
+
+**Added:** 2026-02-04
+
+The `apply()` method supports an optional intersection overlay that preserves structural vehicle features (rims, windows, headlights) from the original reference image.
+
+### Background
+
+The neural renderer outputs raw rendered images, but structural features that don't change with vehicle color can have rendering artifacts. The intersection overlay identifies pixels that are identical between the reference image (neutral gray vehicle) and a cross-reference image (same vehicle with different color), and preserves those pixels from the original reference.
+
+### New Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `x_cross` | array | `None` | Cross-reference image (same vehicle, different color) |
+| `overlay_atol` | float | `1e-2` | Tolerance for intersection mask comparison |
+
+### Algorithm
+
+```python
+# 1. Create intersection mask (True where pixels are nearly identical)
+intersection_mask = np.isclose(x_cross, x_ref, atol=overlay_atol)
+
+# 2. Apply overlay (preserve x_ref where mask is True)
+output = np.where(intersection_mask, x_ref, rendered)
+```
+
+### Usage Examples
+
+```python
+from texture_applicator import TextureApplicator
+
+applicator = TextureApplicator()
+
+# Without overlay (backward compatible):
+rendered = applicator.apply(x_ref, texture)
+
+# With overlay (preserves rims, windows, headlights):
+rendered = applicator.apply(x_ref, texture, x_cross=x_ren)
+
+# With custom tolerance:
+rendered = applicator.apply(x_ref, texture, x_cross=x_ren, overlay_atol=0.05)
+```
+
+### When to Use Overlay
+
+| Scenario | Use Overlay? |
+|----------|-------------|
+| Training/optimization | No - overlay is not differentiable |
+| Evaluation metrics | Yes - more accurate visual quality |
+| Visualization | Yes - cleaner structural features |
+| Generating final results | Yes - publication-quality images |
+
+### CARLA Integration
+
+To use this feature, CARLA needs to provide:
+1. `x_ref`: Reference image (neutral gray vehicle) - already captured
+2. `texture`: The adversarial texture pattern - already generated
+3. `x_cross`: Cross-reference image (same vehicle with DIFFERENT color) - **new requirement**
+
+The cross-reference image should be captured from CARLA with a different vehicle color than the neutral gray reference.
+
+### Implementation Notes
+
+- The overlay operation uses `np.isclose()` with configurable tolerance
+- Overlay is applied per-pixel across all color channels
+- Both single images and batches are supported
+- The feature is backward compatible (default `x_cross=None`)
+
+---
+
+**Status:** Implemented and tested
+**Last Updated:** 2026-02-04

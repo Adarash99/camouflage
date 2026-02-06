@@ -28,31 +28,40 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.cuda.amp import autocast, GradScaler
 
 from models.renderer_pytorch import MaskAwareRenderer
 from models.renderer_dataset import RendererDataset, create_data_loaders
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
-    """Train for one epoch."""
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler=None):
+    """Train for one epoch with optional AMP."""
     model.train()
     total_loss = 0.0
     num_batches = len(train_loader)
+    use_amp = scaler is not None
 
     for batch_idx, (x_combined, y_target) in enumerate(train_loader):
         x_combined = x_combined.to(device)
         y_target = y_target.to(device)
 
-        # Forward pass
         optimizer.zero_grad()
-        output = model(x_combined)
 
-        # Compute loss
-        loss = criterion(output, y_target)
-
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            # Mixed precision forward pass
+            with autocast():
+                output = model(x_combined)
+                loss = criterion(output, y_target)
+            # Scaled backward pass
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard forward pass
+            output = model(x_combined)
+            loss = criterion(output, y_target)
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -64,8 +73,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
     return total_loss / num_batches
 
 
-def validate(model, val_loader, criterion, device):
-    """Validate the model."""
+def validate(model, val_loader, criterion, device, use_amp=False):
+    """Validate the model with optional AMP."""
     model.eval()
     total_loss = 0.0
 
@@ -74,31 +83,39 @@ def validate(model, val_loader, criterion, device):
             x_combined = x_combined.to(device)
             y_target = y_target.to(device)
 
-            output = model(x_combined)
-            loss = criterion(output, y_target)
+            if use_amp:
+                with autocast():
+                    output = model(x_combined)
+                    loss = criterion(output, y_target)
+            else:
+                output = model(x_combined)
+                loss = criterion(output, y_target)
             total_loss += loss.item()
 
     return total_loss / len(val_loader)
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, path):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, path, scaler=None):
     """Save training checkpoint."""
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
         'loss': loss,
     }, path)
 
 
-def load_checkpoint(model, optimizer, scheduler, path, device):
+def load_checkpoint(model, optimizer, scheduler, path, device, scaler=None):
     """Load training checkpoint."""
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler and checkpoint['scheduler_state_dict']:
+    if scheduler and checkpoint.get('scheduler_state_dict'):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if scaler and checkpoint.get('scaler_state_dict'):
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
     return checkpoint['epoch'], checkpoint['loss']
 
 
@@ -112,7 +129,8 @@ def train_renderer(
     val_dataset_path=None,
     resume_path=None,
     num_workers=4,
-    device=None
+    device=None,
+    use_amp=True
 ):
     """
     Train the mask-aware neural renderer.
@@ -128,6 +146,7 @@ def train_renderer(
         resume_path: Path to checkpoint to resume from
         num_workers: Number of data loading workers
         device: Training device ('cuda' or 'cpu')
+        use_amp: Use automatic mixed precision (fp16) for ~50% memory savings
 
     Returns:
         Trained model
@@ -195,6 +214,14 @@ def train_renderer(
         optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6, verbose=True
     )
 
+    # AMP scaler for mixed precision training
+    scaler = GradScaler() if use_amp and device.type == 'cuda' else None
+    if scaler:
+        print(f"Mixed Precision: Enabled (fp16)")
+    else:
+        print(f"Mixed Precision: Disabled")
+    print()
+
     # Resume from checkpoint if provided
     start_epoch = 0
     best_val_loss = float('inf')
@@ -202,7 +229,7 @@ def train_renderer(
     if resume_path:
         print(f"Resuming from: {resume_path}")
         start_epoch, best_val_loss = load_checkpoint(
-            model, optimizer, scheduler, resume_path, device
+            model, optimizer, scheduler, resume_path, device, scaler
         )
         start_epoch += 1  # Start from next epoch
         print(f"  Resumed at epoch {start_epoch}, best loss: {best_val_loss:.6f}")
@@ -224,6 +251,7 @@ def train_renderer(
         'learning_rate': learning_rate,
         'val_split': val_split,
         'device': str(device),
+        'use_amp': scaler is not None,
         'start_time': datetime.now().isoformat(),
     }
     with open(output_dir / 'config.json', 'w') as f:
@@ -237,10 +265,10 @@ def train_renderer(
 
     for epoch in range(start_epoch, epochs):
         # Train
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler)
 
         # Validate
-        val_loss = validate(model, val_loader, criterion, device)
+        val_loss = validate(model, val_loader, criterion, device, use_amp=(scaler is not None))
 
         # Update scheduler
         scheduler.step(val_loss)
@@ -263,7 +291,7 @@ def train_renderer(
         if (epoch + 1) % 10 == 0:
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss,
-                checkpoint_dir / f'epoch_{epoch+1:03d}.pt'
+                checkpoint_dir / f'epoch_{epoch+1:03d}.pt', scaler
             )
 
     # Save final model
@@ -305,7 +333,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100,
                         help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=8,
-                        help='Batch size (8 recommended for 1024x1024 on 24GB GPU)')
+                        help='Batch size (8-10 with AMP on 24GB GPU)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--val-split', type=float, default=0.1,
@@ -316,6 +344,10 @@ def main():
                         help='Number of data loading workers')
     parser.add_argument('--device', type=str, default=None,
                         help='Device (cuda/cpu)')
+    parser.add_argument('--amp', action='store_true', default=True,
+                        help='Use automatic mixed precision (default: True)')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable automatic mixed precision')
     parser.add_argument('--test', action='store_true',
                         help='Run quick test with 3 epochs')
 
@@ -327,6 +359,9 @@ def main():
         args.epochs = 3
         args.batch_size = 2
 
+    # Determine AMP setting
+    use_amp = args.amp and not args.no_amp
+
     train_renderer(
         dataset_path=args.dataset,
         output_dir=args.output,
@@ -337,7 +372,8 @@ def main():
         val_dataset_path=args.val_dataset,
         resume_path=args.resume,
         num_workers=args.workers,
-        device=args.device
+        device=args.device,
+        use_amp=use_amp
     )
 
 
